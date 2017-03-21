@@ -2,254 +2,289 @@ package powerdns
 
 import (
 	"fmt"
-	"github.com/dghubble/sling"
 	"net/url"
 	"strings"
+
+	"github.com/dghubble/sling"
 )
 
+// Error struct
 type Error struct {
 	Message string `json:"error"`
 }
 
+// Error Returns
 func (e Error) Error() string {
 	return fmt.Sprintf("%v", e.Message)
 }
 
-type CombinedRecord struct {
-	Name    string
-	Type    string
-	TTL     int
-	Records []string
+// ServerInfo struct
+type ServerInfo struct {
+	ConfigURL  string `json:"config_url"`
+	DaemonType string `json:"daemon_type"`
+	ID         string `json:"id"`
+	Type       string `json:"type"`
+	URL        string `json:"url"`
+	Version    string `json:"version"`
+	ZonesURL   string `json:"zones_url"`
 }
 
-// Zone
+// Zone struct
 type Zone struct {
-	Id             string `json:"id"`
-	Url            string `json:"url"`
-	Name           string `json:"name"`
-	Type           string `json:"type"`
-	DNSsec         bool   `json:"dnssec"`
-	Serial         int    `json:"serial"`
-	NotifiedSerial int    `json:"notified_serial"`
-	LastCheck      int    `json:"last_check"`
-	Records        []struct {
-		Name     string `json:"name"`
-		Type     string `json:"type"`
-		TTL      int    `json:"ttl"`
-		Priority int    `json:"priority"`
-		Disabled bool   `json:"disabled"`
-		Content  string `json:"content"`
-	} `json:"records"`
+	ID             string   `json:"id"`
+	URL            string   `json:"url"`
+	Name           string   `json:"name"`
+	Type           string   `json:"type"`
+	DNSsec         bool     `json:"dnssec"`
+	Serial         int      `json:"serial"`
+	NotifiedSerial int      `json:"notified_serial"`
+	LastCheck      int      `json:"last_check"`
+	RRsets         []RRset  `json:"rrsets"`
+	Records        []Record `json:"records"`
 }
 
-// RR
+// Record struct
 type Record struct {
 	Name     string `json:"name"`
 	Type     string `json:"type"`
-	TTL      int    `json:"ttl"`
-	Priority int    `json:"priority"`
-	Disabled bool   `json:"disabled"`
 	Content  string `json:"content"`
+	TTL      int    `json:"ttl"`
+	Disabled bool   `json:"disabled"`
 }
 
-// RRset
+// RRset struct
 type RRset struct {
 	Name       string   `json:"name"`
 	Type       string   `json:"type"`
-	ChangeType string   `json:"changetype"`
+	TTL        int      `json:"ttl"`
 	Records    []Record `json:"records"`
+	ChangeType string   `json:"changetype"`
 }
 
-// RRsets
+// RRsets struct
 type RRsets struct {
 	Sets []RRset `json:"rrsets"`
 }
 
+// PowerDNS struct
 type PowerDNS struct {
-	hostname string
-	port     string
-	server   string
-	apikey   string
+	scheme     string
+	hostname   string
+	port       string
+	path       string
+	server     string
+	domain     string
+	apikey     string
+	apiVersion int
 }
 
 // New returns a new PowerDNS
-func New() *PowerDNS {
-	return &PowerDNS{
-		hostname: "localhost",
-		port:     "8081",
-		server:   "localhost",
-		apikey:   "apikey",
+func New(baseURL string, server string, domain string, apikey string) (*PowerDNS, error) {
+
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return nil, fmt.Errorf("%s is not a valid url: %v", baseURL, err)
 	}
+	hp := strings.Split(u.Host, ":")
+	hostname := hp[0]
+
+	var port string
+	if len(hp) > 1 {
+		port = hp[1]
+	} else {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+
+	if server == "" {
+		server = "localhost"
+	}
+
+	powerdns := &PowerDNS{
+		scheme:     u.Scheme,
+		hostname:   hostname,
+		port:       port,
+		path:       u.Path,
+		server:     server,
+		domain:     domain,
+		apikey:     apikey,
+		apiVersion: -1,
+	}
+
+	powerdns.apiVersion, err = powerdns.detectAPIVersion()
+	if err != nil {
+		return nil, err
+	}
+
+	return powerdns, nil
 }
 
-func (p *PowerDNS) Hostname(hostname string) *PowerDNS {
-	p.hostname = hostname
-	return p
+// AddRecord ...
+func (p *PowerDNS) AddRecord(name string, recordType string, ttl int, content []string) error {
+
+	return p.ChangeRecord(name, recordType, ttl, content, "REPLACE")
 }
 
-func (p *PowerDNS) ApiKey(apikey string) *PowerDNS {
-	p.apikey = apikey
-	return p
+// DeleteRecord ...
+func (p *PowerDNS) DeleteRecord(name string, recordType string, ttl int, content []string) error {
+
+	return p.ChangeRecord(name, recordType, ttl, content, "DELETE")
 }
 
-func (p *PowerDNS) Port(port string) *PowerDNS {
-	p.port = port
-	return p
+// ChangeRecord ...
+func (p *PowerDNS) ChangeRecord(name string, recordType string, ttl int, contents []string, action string) error {
+
+	// Add trailing dot for V1 and removes it for V0
+	if p.apiVersion == 1 {
+		name = addTrailingCharacter(name, '.')
+	} else {
+		name = strings.TrimRight(name, ".")
+	}
+
+	rrset := RRset{
+		Name: name,
+		Type: recordType,
+		TTL:  ttl,
+	}
+
+	for _, content := range contents {
+		if rrset.Type == "TXT" {
+			content = "\"" + strings.Replace(content, "\"", "", -1) + "\""
+		}
+		rrset.Records = append(rrset.Records, Record{
+			Content: content,
+			Name:    name,
+			TTL:     ttl,
+			Type:    recordType,
+		})
+	}
+
+	return p.patchRRset(rrset, action)
 }
 
-func (p *PowerDNS) Server(server string) *PowerDNS {
-	p.server = server
-	return p
-}
-
-func (p *PowerDNS) AddRecord(name string, record_type string, ttl int, records []string) (*Zone, error) {
-
-	zone, err := p.ChangeRecord(name, record_type, ttl, records, "UPSERT")
-	
-	return zone, err
-}
-
-func (p *PowerDNS) DeleteRecord(name string, record_type string, ttl int, records []string) (*Zone, error) {
-
-	zone, err := p.ChangeRecord(name, record_type, ttl, records, "DELETE")
-	
-	return zone, err
-}
-
-func (p *PowerDNS) ChangeRecord(name string, record_type string, ttl int, records []string, action string) (*Zone, error) {
-
-	Record := new(CombinedRecord)
-	Record.Name = name
-	Record.Type = record_type
-	Record.TTL = ttl
-	Record.Records = records
-
-	zone, err := p.patchRRset(*Record, action)
-	
-	return zone, err
-}
-
-func (p *PowerDNS) patchRRset(record CombinedRecord, action string) (*Zone, error) {
-
-    if strings.HasSuffix(record.Name, ".") {
-        record.Name = strings.TrimSuffix(record.Name, ".");
-    }
-
-    Set := RRset{ Name: record.Name, Type: record.Type, ChangeType: "REPLACE" }
-
-    if action == "DELETE" {
-        Set.ChangeType = "DELETE"
-    }
-
-    var R Record
-
-    for _, rec := range record.Records {
-        R = Record{ Name: record.Name, Type: record.Type, Content: rec }
-        Set.Records = append(Set.Records, R)
-    }
-
-    json := RRsets{}
-    json.Sets = append(json.Sets, Set)
-
-    error := new(Error)
-    zone := new(Zone)
-
-    resp, err := p.getSling().Patch("rancher").BodyJSON(json).Receive(zone, error);
-
-    if err == nil && resp.StatusCode >= 400 {
-    	error.Message = strings.Join([]string{resp.Status, error.Message}, " ")
-    	return nil, error
-    }
-
-    return zone, err
-}
-
-func (p *PowerDNS) getSling() (*sling.Sling) {
-
-	Url := new(url.URL)
-	Url.Host = p.hostname + ":" + p.port
-	Url.Scheme = "http"
-	Url.Path = "/servers/" + p.server + "/zones/"
-
-	Sling := sling.New().Base(Url.String())
-
-	Sling.Set("X-API-Key", p.apikey)
-
-	return Sling
-}
-
-func (p *PowerDNS) GetRecords(zone_name string) ([]Record, error) {
+// GetRecords ...
+func (p *PowerDNS) GetRecords() ([]Record, error) {
 
 	var records []Record
 
 	zone := new(Zone)
-	error := new(Error)
+	rerr := new(Error)
 
-	Url := new(url.URL)
-	Url.Host = p.hostname + ":" + p.port
-	Url.Scheme = "http"
-	Url.Path = "/servers/" + p.server + "/zones/"
-
-	resp, err := p.getSling().Path(zone_name).Set("X-API-Key", p.apikey).Receive(zone, error)
+	resp, err := p.getSling().Path(p.path+"/servers/"+p.server+"/zones/"+p.domain).Set("X-API-Key", p.apikey).Receive(zone, rerr)
 
 	if err != nil {
 		return records, fmt.Errorf("PowerDNS API call has failed: %v", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		error.Message = strings.Join([]string{resp.Status, error.Message}, " ")
-		return records, error
+		rerr.Message = strings.Join([]string{resp.Status, rerr.Message}, " ")
+		return records, rerr
 	}
 
-	for _, rec := range zone.Records {
-		record := Record{Name: rec.Name, Type: rec.Type, TTL: rec.TTL, Priority: rec.Priority, Disabled: rec.Disabled, Content: rec.Content}
-		records = append(records, record)
+	if len(zone.Records) > 0 {
+		for i, record := range zone.Records {
+			if record.Type == "TXT" {
+				zone.Records[i].Content = strings.Replace(record.Content, "\"", "", -1)
+			}
+		}
+		records = zone.Records
+	} else {
+		for _, rrset := range zone.RRsets {
+			for _, rec := range rrset.Records {
+				if rrset.Type == "TXT" {
+					rec.Content = strings.Replace(rec.Content, "\"", "", -1)
+				}
+				if p.apiVersion == 1 {
+					rrset.Name = strings.TrimRight(rrset.Name, ".")
+				}
+				record := Record{
+					Name:     rrset.Name,
+					Type:     rrset.Type,
+					Content:  rec.Content,
+					TTL:      rrset.TTL,
+					Disabled: rec.Disabled,
+				}
+				records = append(records, record)
+			}
+		}
 	}
 
 	return records, err
 }
 
-func (p *PowerDNS) GetCombinedRecords(ApiKey string) ([]CombinedRecord, error) {
-	var records []CombinedRecord
-	var uniqueRecords []CombinedRecord
+func (p *PowerDNS) patchRRset(rrset RRset, action string) error {
 
-	//- Plain records from the zone
-	Records, err := p.GetRecords(ApiKey)
+	rrset.ChangeType = "REPLACE"
 
-	if err != nil {
-		return records, err
+	if action == "DELETE" {
+		rrset.ChangeType = "DELETE"
 	}
 
-	//- Iterate through records to combine them by name and type
-	for _, rec := range Records {
-		record := CombinedRecord{Name: rec.Name, Type: rec.Type, TTL: rec.TTL}
-		found := false
-		for _, u_rec := range uniqueRecords {
-			if u_rec.Name == rec.Name && u_rec.Type == rec.Type {
-				found = true
-				continue
-			}
-		}
+	sets := RRsets{}
+	sets.Sets = append(sets.Sets, rrset)
 
-		//- append them only if missing
-		if found == false {
-			uniqueRecords = append(uniqueRecords, record)
-		}
+	rerr := new(Error)
+	zone := new(Zone)
+
+	resp, err := p.getSling().Path(p.path+"/servers/"+p.server+"/zones/").Patch(p.domain).BodyJSON(sets).Receive(zone, rerr)
+
+	if err == nil && resp.StatusCode >= 400 {
+		rerr.Message = strings.Join([]string{resp.Status, rerr.Message}, " ")
+		return rerr
 	}
 
-	//- Get all values from the unique records
-	for _, u_rec := range uniqueRecords {
-		for _, rec := range Records {
-			if u_rec.Name == rec.Name && u_rec.Type == rec.Type {
-				u_rec.Records = append(u_rec.Records, rec.Content)
-			}
-		}
-		records = append(records, u_rec)
+	if resp.StatusCode == 204 {
+		return nil
 	}
 
-	return records, nil
+	return err
 }
 
-func init() {
+func (p *PowerDNS) detectAPIVersion() (int, error) {
 
+	info := new(ServerInfo)
+	rerr := new(Error)
+
+	resp, err := p.getSling().Path("servers/").Path(p.server).Receive(info, rerr)
+
+	if resp.StatusCode != 200 {
+		rerr.Message = strings.Join([]string{resp.Status, rerr.Message}, " ")
+		return -1, rerr
+	}
+
+	if err != nil {
+		return -1, err
+	}
+
+	if len(info.ConfigURL) > 6 && info.ConfigURL[0:7] == "/api/v1" {
+		return 1, nil
+	}
+
+	return 0, err
+}
+
+func (p *PowerDNS) getSling() *sling.Sling {
+
+	u := new(url.URL)
+	u.Host = p.hostname + ":" + p.port
+	u.Scheme = p.scheme
+	u.Path = p.path
+
+	// Add trailing slash if necessary
+	u.Path = addTrailingCharacter(u.Path, '/')
+
+	return sling.New().Base(u.String()).Set("X-API-Key", p.apikey)
+}
+
+func addTrailingCharacter(name string, character byte) string {
+
+	// Add trailing dot if necessary
+	if len(name) > 0 && name[len(name)-1] != character {
+		name += string(character)
+	}
+
+	return name
 }
